@@ -17,31 +17,19 @@
 #include <span>
 
 #include <errno.h>
-#include <libaio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <immintrin.h>
+//#include <immintrin.h>
 #include "utils.hpp"
 #include "buffer_manager.hpp"
 
 namespace std {
     BufferManager* bm=NULL;
 
-    void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
-        void* page = info->si_addr;
-        if (bm->isValidPtr(page)) {
-            cerr << "segfault restart " << bm->toPID(page) << endl;
-            throw OLCRestartException();
-        } else {
-            cerr << "segfault " << page << endl;
-            _exit(1);
-        }
-    }
-    
     template<class T>
         struct GuardO {
             PID pid;

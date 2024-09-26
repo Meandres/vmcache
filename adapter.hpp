@@ -17,14 +17,13 @@
 #include <span>
 
 #include <errno.h>
-#include <libaio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <immintrin.h>
+//#include <immintrin.h>
 #include "utils.hpp"
 #include "btree.hpp"
 

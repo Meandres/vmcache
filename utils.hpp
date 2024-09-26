@@ -17,14 +17,15 @@
 #include <span>
 
 #include <errno.h>
-#include <libaio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <immintrin.h>
+//#include <immintrin.h>
+#include <arm_acle.h>
+#include <pthread_np.h>
 
 namespace std {
     typedef uint8_t u8;
@@ -42,9 +43,6 @@ namespace std {
     typedef struct parameters {
         u64 virtSize;
         u64 physSize;
-        const char* path;
-        bool useExmap;
-        u64 batch;
     } params_t;
 
     static const int16_t maxWorkerThreads = 128;
@@ -55,28 +53,33 @@ namespace std {
  
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
-    uint64_t rdtsc() {
-        uint32_t hi, lo;
-        __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
-        return static_cast<uint64_t>(lo)|(static_cast<uint64_t>(hi)<<32);
+    typedef chrono::time_point<std::chrono::high_resolution_clock> timepoint;
+
+    timepoint now(){
+	    return chrono::high_resolution_clock::now();
+    }
+    
+    uint64_t diff_ns(timepoint s, timepoint e){
+	    return chrono::nanoseconds(e - s).count();
     }
 
-    // exmap helper function
-    static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
-        struct exmap_action_params params_free = { .interface = workerThreadId, .iov_len = len, .opcode = (u16)op, };
-        return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
+    uint64_t rdtsc() {
+        int64_t tsc;
+	asm volatile("mrs %0, cntvct_el0" : "=r"(tsc));
+	//asm volatile("mrs %0, pmccntr_el0" : "=r" (tsc));
+        return tsc;
     }
 
     // allocate memory using huge pages
     void* allocHuge(size_t size) {
         void* p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        madvise(p, size, MADV_HUGEPAGE);
+        //madvise(p, size, MADV_HUGEPAGE);
         return p;
     }
 
     // use when lock is not free
     void yield(u64 counter) {
-        _mm_pause();
+	__yield();
     }
 
     u64 envOr(const char* env, u64 value) {
