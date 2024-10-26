@@ -43,7 +43,6 @@ namespace std {
         u64 virtSize;
         u64 physSize;
         const char* path;
-        bool useExmap;
         u64 batch;
     } params_t;
 
@@ -59,12 +58,6 @@ namespace std {
         uint32_t hi, lo;
         __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
         return static_cast<uint64_t>(lo)|(static_cast<uint64_t>(hi)<<32);
-    }
-
-    // exmap helper function
-    static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
-        struct exmap_action_params params_free = { .interface = workerThreadId, .iov_len = len, .opcode = (u16)op, };
-        return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
     }
 
     // allocate memory using huge pages

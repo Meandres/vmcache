@@ -23,56 +23,39 @@
 #include <unistd.h>
 #include <immintrin.h>
 
-#include "exmap.h"
-
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
 
 #include "utils.hpp"
 #include "adapter.hpp"
-#include "btree.hpp"
+#include "btree_transparent.hpp"
 
 using namespace std;
 
 int main(int argc, char** argv) {
-    bool useExmap = envOr("EXMAP", 0);
-    if (useExmap) {
-        struct sigaction action;
-        action.sa_flags = SA_SIGINFO;
-        action.sa_sigaction = handleSEGFAULT;
-        if (sigaction(SIGSEGV, &action, NULL) == -1) {
-            perror("sigusr: sigaction");
-            exit(1);
-        }
-    }
-
     unsigned nthreads = envOr("THREADS", 1);
     u64 n = envOr("DATASIZE", 10);
     u64 runForSec = envOr("RUNFOR", 30);
-    bool isRndread = envOr("RNDREAD", 0);
+    bool isRndread = envOr("RNDREAD", 1);
     params_t params;
     params.virtSize = envOr("VIRTGB", 16);
     params.physSize = envOr("PHYSGB", 4);
     params.batch = envOr("BATCH", 64);
-    params.useExmap = useExmap;
     params.path = getenv("BLOCK") ? getenv("BLOCK"): "/tmp/bm";
-
 
     u64 statDiff = 1e8;
     atomic<u64> txProgress(0);
     atomic<bool> keepRunning(true);
-    auto systemName = useExmap ? "exmap" : "vmcache";
+    auto systemName = "mmap";
 
     auto statFn = [&]() {
-        cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
+        cout << "ts,tx,system,threads,datasize,workload,batch" << endl;
         u64 cnt = 0;
         for (uint64_t i=0; i<runForSec; i++) {
             sleep(1);
-            float rmb = (bm->readCount.exchange(0)*pageSize)/(1024.0*1024);
-            float wmb = (bm->writeCount.exchange(0)*pageSize)/(1024.0*1024);
             u64 prog = txProgress.exchange(0);
-            cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;
+            cout << cnt++ << "," << prog << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;
         }
         keepRunning = false;
     };
@@ -83,47 +66,45 @@ int main(int argc, char** argv) {
 
         {
             // insert
-            parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-                    workerThreadId = worker;
-                    array<u8, 120> payload;
-                    for (u64 i=begin; i<end; i++) {
-                    union { u64 v1; u8 k1[sizeof(u64)]; };
-                    v1 = __builtin_bswap64(i);
-                    memcpy(payload.data(), k1, sizeof(u64));
-                    bt->insert({k1, sizeof(KeyType)}, payload);
-                    }
-                    });
+            //parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+            workerThreadId = 0;
+            array<u8, 120> payload;
+            for (u64 i=begin; i<end; i++) {
+                union { u64 v1; u8 k1[sizeof(u64)]; };
+                v1 = __builtin_bswap64(i);
+                memcpy(payload.data(), k1, sizeof(u64));
+                bt->insert({k1, sizeof(KeyType)}, payload);
+            }
+            //});
         }
-        cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
+        cerr << "space: " << (bm->allocCount*pageSize)/(float)bm->gb << " GB " << endl;
 
-        bm->readCount = 0;
-        bm->writeCount = 0;
         thread statThread(statFn);
 
         parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-                workerThreadId = worker;
-                u64 cnt = 0;
-                u64 start = rdtsc();
-                while (keepRunning.load()) {
+            workerThreadId = worker;
+            u64 cnt = 0;
+            u64 start = rdtsc();
+            while (keepRunning.load()) {
                 union { u64 v1; u8 k1[sizeof(u64)]; };
                 v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
 
                 array<u8, 120> payload;
                 bool succ = bt->lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-                        memcpy(payload.data(), p.data(), p.size());
-                        });
+                    memcpy(payload.data(), p.data(), p.size());
+                });
                 assert(succ);
                 assert(memcmp(k1, payload.data(), sizeof(u64))==0);
 
                 cnt++;
                 u64 stop = rdtsc();
                 if ((stop-start) > statDiff) {
-                txProgress += cnt;
-                start = stop;
-                cnt = 0;
+                    txProgress += cnt;
+                    start = stop;
+                    cnt = 0;
                 }
-                }
-                txProgress += cnt;
+            }
+            txProgress += cnt;
         });
 
         statThread.join();

@@ -26,283 +26,11 @@
 #include <unistd.h>
 #include <immintrin.h>
 #include "utils.hpp"
-#include "buffer_manager.hpp"
+#include "mmap_adapter.hpp"
 
-namespace std {
-    BufferManager* bm=NULL;
+namespace std {     
 
-    void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
-        void* page = info->si_addr;
-        if (bm->isValidPtr(page)) {
-            cerr << "segfault restart " << bm->toPID(page) << endl;
-            throw OLCRestartException();
-        } else {
-            cerr << "segfault " << page << endl;
-            _exit(1);
-        }
-    }
-    
-    template<class T>
-        struct GuardO {
-            PID pid;
-            T* ptr;
-            u64 version;
-            static const u64 moved = ~0ull;
-
-            // constructor
-            explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
-                init();
-            }
-
-            template<class T2>
-                GuardO(u64 pid, GuardO<T2>& parent)  {
-                    parent.checkVersionAndRestart();
-                    this->pid = pid;
-                    ptr = reinterpret_cast<T*>(bm->toPtr(pid));
-                    init();
-                }
-
-            GuardO(GuardO&& other) {
-                pid = other.pid;
-                ptr = other.ptr;
-                version = other.version;
-            }
-
-            void init() {
-                assert(pid != moved);
-                PageState& ps = bm->getPageState(pid);
-                for (u64 repeatCounter=0; ; repeatCounter++) {
-                    u64 v = ps.stateAndVersion.load();
-                    switch (PageState::getState(v)) {
-                        case PageState::Marked: {
-                                                    u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-                                                    if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                                                        version = newV;
-                                                        return;
-                                                    }
-                                                    break;
-                                                }
-                        case PageState::Locked:
-                                                break;
-                        case PageState::Evicted:
-                                                if (ps.tryLockX(v)) {
-                                                    bm->handleFault(pid);
-                                                    bm->unfixX(pid);
-                                                }
-                                                break;
-                        default:
-                                                version = v;
-                                                return;
-                    }
-                    yield(repeatCounter);
-                }
-            }
-
-            // move assignment operator
-            GuardO& operator=(GuardO&& other) {
-                if (pid != moved)
-                    checkVersionAndRestart();
-                pid = other.pid;
-                ptr = other.ptr;
-                version = other.version;
-                other.pid = moved;
-                other.ptr = nullptr;
-                return *this;
-            }
-
-            // assignment operator
-            GuardO& operator=(const GuardO&) = delete;
-
-            // copy constructor
-            GuardO(const GuardO&) = delete;
-
-            void checkVersionAndRestart() {
-                if (pid != moved) {
-                    PageState& ps = bm->getPageState(pid);
-                    u64 stateAndVersion = ps.stateAndVersion.load();
-                    if (version == stateAndVersion) // fast path, nothing changed
-                        return;
-                    if ((stateAndVersion<<8) == (version<<8)) { // same version
-                        u64 state = PageState::getState(stateAndVersion);
-                        if (state <= PageState::MaxShared)
-                            return; // ignore shared locks
-                        if (state == PageState::Marked)
-                            if (ps.stateAndVersion.compare_exchange_weak(stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
-                                return; // mark cleared
-                    }
-                    if (std::uncaught_exceptions()==0)
-                        throw OLCRestartException();
-                }
-            }
-
-            // destructor
-            ~GuardO() noexcept(false) {
-                checkVersionAndRestart();
-            }
-
-            T* operator->() {
-                assert(pid != moved);
-                return ptr;
-            }
-
-            void release() {
-                checkVersionAndRestart();
-                pid = moved;
-                ptr = nullptr;
-            }
-        };
-
-    template<class T>
-        struct GuardX {
-            PID pid;
-            T* ptr;
-            static const u64 moved = ~0ull;
-
-            // constructor
-            GuardX(): pid(moved), ptr(nullptr) {}
-
-            // constructor
-            explicit GuardX(u64 pid) : pid(pid) {
-                ptr = reinterpret_cast<T*>(bm->fixX(pid));
-                ptr->dirty = true;
-            }
-
-            explicit GuardX(GuardO<T>&& other) {
-                assert(other.pid != moved);
-                for (u64 repeatCounter=0; ; repeatCounter++) {
-                    PageState& ps = bm->getPageState(other.pid);
-                    u64 stateAndVersion = ps.stateAndVersion;
-                    if ((stateAndVersion<<8) != (other.version<<8))
-                        throw OLCRestartException();
-                    u64 state = PageState::getState(stateAndVersion);
-                    if ((state == PageState::Unlocked) || (state == PageState::Marked)) {
-                        if (ps.tryLockX(stateAndVersion)) {
-                            pid = other.pid;
-                            ptr = other.ptr;
-                            ptr->dirty = true;
-                            other.pid = moved;
-                            other.ptr = nullptr;
-                            return;
-                        }
-                    }
-                    yield(repeatCounter);
-                }
-            }
-
-            // assignment operator
-            GuardX& operator=(const GuardX&) = delete;
-
-            // move assignment operator
-            GuardX& operator=(GuardX&& other) {
-                if (pid != moved) {
-                    bm->unfixX(pid);
-                }
-                pid = other.pid;
-                ptr = other.ptr;
-                other.pid = moved;
-                other.ptr = nullptr;
-                return *this;
-            }
-
-            // copy constructor
-            GuardX(const GuardX&) = delete;
-
-            // destructor
-            ~GuardX() {
-                if (pid != moved)
-                    bm->unfixX(pid);
-            }
-
-            T* operator->() {
-                assert(pid != moved);
-                return ptr;
-            }
-
-            void release() {
-                if (pid != moved) {
-                    bm->unfixX(pid);
-                    pid = moved;
-                }
-            }
-        };
-
-    template<class T>
-        struct AllocGuard : public GuardX<T> {
-            template <typename ...Params>
-                AllocGuard(Params&&... params) {
-                    GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
-                    new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
-                    GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
-                }
-        };
-
-    template<class T>
-        struct GuardS {
-            PID pid;
-            T* ptr;
-            static const u64 moved = ~0ull;
-
-            // constructor
-            explicit GuardS(u64 pid) : pid(pid) {
-                ptr = reinterpret_cast<T*>(bm->fixS(pid));
-            }
-
-            GuardS(GuardO<T>&& other) {
-                assert(other.pid != moved);
-                if (bm->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
-                    pid = other.pid;
-                    ptr = other.ptr;
-                    other.pid = moved;
-                    other.ptr = nullptr;
-                } else {
-                    throw OLCRestartException();
-                }
-            }
-
-            GuardS(GuardS&& other) {
-                if (pid != moved)
-                    bm->unfixS(pid);
-                pid = other.pid;
-                ptr = other.ptr;
-                other.pid = moved;
-                other.ptr = nullptr;
-            }
-
-            // assignment operator
-            GuardS& operator=(const GuardS&) = delete;
-
-            // move assignment operator
-            GuardS& operator=(GuardS&& other) {
-                if (pid != moved)
-                    bm->unfixS(pid);
-                pid = other.pid;
-                ptr = other.ptr;
-                other.pid = moved;
-                other.ptr = nullptr;
-                return *this;
-            }
-
-            // copy constructor
-            GuardS(const GuardS&) = delete;
-
-            // destructor
-            ~GuardS() {
-                if (pid != moved)
-                    bm->unfixS(pid);
-            }
-
-            T* operator->() {
-                assert(pid != moved);
-                return ptr;
-            }
-
-            void release() {
-                if (pid != moved) {
-                    bm->unfixS(pid);
-                    pid = moved;
-                }
-            }
-        };
+    MmapRegion* bm=NULL;
 
     struct BTreeNode;
 
@@ -665,8 +393,9 @@ namespace std {
             BTreeNode tmp(isLeaf);
             BTreeNode* nodeLeft = &tmp;
 
-            AllocGuard<BTreeNode> newNode(isLeaf);
-            BTreeNode* nodeRight = newNode.ptr;
+            u64 newPID = bm->getNextPid(); 
+            BTreeNode* nodeRight = (BTreeNode*)bm->toPtr(newPID);
+            nodeRight->isLeaf = this->isLeaf;
 
             nodeLeft->setFences(getLowerFence(), sep);
             nodeRight->setFences(sep, getUpperFence());
@@ -675,17 +404,17 @@ namespace std {
             u16 oldParentSlot = parent->lowerBound(sep);
             if (oldParentSlot == parent->count) {
                 assert(parent->upperInnerNode == leftPID);
-                parent->upperInnerNode = newNode.pid;
+                parent->upperInnerNode = newPID;
             } else {
                 assert(parent->getChild(oldParentSlot) == leftPID);
-                memcpy(parent->getPayload(oldParentSlot).data(), &newNode.pid, sizeof(PID));
+                memcpy(parent->getPayload(oldParentSlot).data(), &newPID, sizeof(PID));
             }
             parent->insertInPage(sep, {reinterpret_cast<u8*>(&leftPID), sizeof(PID)});
 
             if (isLeaf) {
                 copyKeyValueRange(nodeLeft, 0, 0, sepSlot + 1);
                 copyKeyValueRange(nodeRight, 0, nodeLeft->count, count - nodeLeft->count);
-                nodeLeft->nextLeafNode = newNode.pid;
+                nodeLeft->nextLeafNode = newPID;
                 nodeRight->nextLeafNode = this->nextLeafNode;
             } else {
                 // in inner node split, separator moves to parent (count == 1 + nodeLeft->count + nodeRight->count)
@@ -789,24 +518,25 @@ namespace std {
 
             BTree(params_t* params) : splitOrdered(false) {
                 if(bm == NULL){
-                    bm = new BufferManager(params);
+                    bm = new MmapRegion(params);
                 }
-                GuardX<MetaDataPage> page(metadataPageId);
-                AllocGuard<BTreeNode> rootNode(true);
+                MetaDataPage* page = (MetaDataPage*)bm->toPtr(metadataPageId);
+                u64 newPid = bm->getNextPid();
+                BTreeNode* rootNode = (BTreeNode*)bm->toPtr(newPid);
+                rootNode->isLeaf = true;
                 slotId = btreeslotcounter++;
-                page->roots[slotId] = rootNode.pid;
+                page->roots[slotId] = newPid;
             }
 
             ~BTree() {}
 
 
-            GuardO<BTreeNode> findLeafO(span<u8> key) {
-                GuardO<MetaDataPage> meta(metadataPageId);
-                GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
-                meta.release();
+            BTreeNode* findLeafO(span<u8> key) {
+                MetaDataPage* meta = (MetaDataPage*)bm->toPtr(metadataPageId);
+                BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
                 while (node->isInner())
-                    node = GuardO<BTreeNode>(node->lookupInner(key), node);
+                    node = (BTreeNode*)bm->toPtr(node->lookupInner(key));
                 return node;
             }
 
@@ -814,7 +544,7 @@ namespace std {
             int lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize) {
                 for (u64 repeatCounter=0; ; repeatCounter++) {
                     try {
-                        GuardO<BTreeNode> node = findLeafO(key);
+                        BTreeNode* node = findLeafO(key);
                         bool found;
                         unsigned pos = node->lowerBound(key, found);
                         if (!found)
@@ -831,7 +561,7 @@ namespace std {
                 bool lookup(span<u8> key, Fn fn) {
                     for (u64 repeatCounter=0; ; repeatCounter++) {
                         try {
-                            GuardO<BTreeNode> node = findLeafO(key);
+                            BTreeNode* node = findLeafO(key);
                             bool found;
                             unsigned pos = node->lowerBound(key, found);
                             if (!found)
@@ -843,16 +573,18 @@ namespace std {
                         } catch(const OLCRestartException&) { yield(repeatCounter); }
                     }
                 }
-            void trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen)
+            void trySplit(BTreeNode* node, BTreeNode* parent, span<u8> key, unsigned payloadLen)
             {
 
                 // create new root if necessary
-                if (parent.pid == metadataPageId) {
-                    MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(parent.ptr);
-                    AllocGuard<BTreeNode> newRoot(false);
-                    newRoot->upperInnerNode = node.pid;
-                    metaData->roots[slotId] = newRoot.pid;
-                    parent = move(newRoot);
+                if (bm->toPID(&parent) == metadataPageId) {
+                    MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(&parent);
+                    u64 newPid = bm->getNextPid();
+                    BTreeNode* newRoot = (BTreeNode*)bm->toPtr(newPid);
+                    newRoot->isLeaf = false;
+                    newRoot->upperInnerNode = bm->toPID(node);
+                    metaData->roots[slotId] = newPid;
+                    parent = newRoot;
                 }
 
                 // split
@@ -861,33 +593,30 @@ namespace std {
                 node->getSep(sepKey, sepInfo);
 
                 if (parent->hasSpaceFor(sepInfo.len, sizeof(PID))) {  // is there enough space in the parent for the separator?
-                    node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len});
+                    node->splitNode(parent, sepInfo.slot, {sepKey, sepInfo.len});
                     return;
                 }
 
                 // must split parent to make space for separator, restart from root to do this
-                node.release();
-                parent.release();
-                ensureSpace(parent.ptr, {sepKey, sepInfo.len}, sizeof(PID));
+                ensureSpace(parent, {sepKey, sepInfo.len}, sizeof(PID));
             }
 
             void ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
             {
                 for (u64 repeatCounter=0; ; repeatCounter++) {
                     try {
-                        GuardO<BTreeNode> parent(metadataPageId);
-                        GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
+                        BTreeNode* parent = (BTreeNode*)bm->toPtr(metadataPageId);
+                        MetaDataPage* meta = (MetaDataPage*)parent;
+                        BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
-                        while (node->isInner() && (node.ptr != toSplit)) {
+                        while (node->isInner() && (node != toSplit)) {
                             parent = move(node);
-                            node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
+                            node = (BTreeNode*)bm->toPtr(parent->lookupInner(key));
                         }
-                        if (node.ptr == toSplit) {
+                        if (node == toSplit) {
                             if (node->hasSpaceFor(key.size(), payloadLen))
                                 return; // someone else did split concurrently
-                            GuardX<BTreeNode> parentLocked(move(parent));
-                            GuardX<BTreeNode> nodeLocked(move(node));
-                            trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
+                            trySplit(node, parent, key, payloadLen);
                         }
                         return;
                     } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -900,26 +629,23 @@ namespace std {
 
                 for (u64 repeatCounter=0; ; repeatCounter++) {
                     try {
-                        GuardO<BTreeNode> parent(metadataPageId);
-                        GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
+                        BTreeNode* parent = (BTreeNode*)bm->toPtr(metadataPageId);
+                        MetaDataPage* meta = (MetaDataPage*)parent;
+                        BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
                         while (node->isInner()) {
                             parent = move(node);
-                            node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
+                            node = (BTreeNode*)bm->toPtr(parent->lookupInner(key));
                         }
 
                         if (node->hasSpaceFor(key.size(), payload.size())) {
                             // only lock leaf
-                            GuardX<BTreeNode> nodeLocked(move(node));
-                            parent.release();
-                            nodeLocked->insertInPage(key, payload);
+                            node->insertInPage(key, payload);
                             return; // success
                         }
 
                         // lock parent and leaf
-                        GuardX<BTreeNode> parentLocked(move(parent));
-                        GuardX<BTreeNode> nodeLocked(move(node));
-                        trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
+                        trySplit(node, parent, key, payload.size());
                         // insert hasn't happened, restart from root
                     } catch(const OLCRestartException&) { yield(repeatCounter); }
                 }
@@ -929,15 +655,16 @@ namespace std {
             {
                 for (u64 repeatCounter=0; ; repeatCounter++) {
                     try {
-                        GuardO<BTreeNode> parent(metadataPageId);
-                        GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
+                        BTreeNode* parent = (BTreeNode*)bm->toPtr(metadataPageId);
+                        MetaDataPage* meta = (MetaDataPage*)parent;
+                        BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
                         u16 pos;
                         while (node->isInner()) {
                             pos = node->lowerBound(key);
                             PID nextPage = (pos == node->count) ? node->upperInnerNode : node->getChild(pos);
                             parent = move(node);
-                            node = GuardO<BTreeNode>(nextPage, parent);
+                            node = (BTreeNode*)bm->toPtr(nextPage);
                         }
 
                         bool found;
@@ -946,21 +673,17 @@ namespace std {
                             return false;
 
                         unsigned sizeEntry = node->slot[slotId].keyLen + node->slot[slotId].payloadLen;
-                        if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (parent.pid != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
+                        if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (bm->toPID(parent) != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
                             // underfull
-                            GuardX<BTreeNode> parentLocked(move(parent));
-                            GuardX<BTreeNode> nodeLocked(move(node));
-                            GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
-                            nodeLocked->removeSlot(slotId);
-                            if (rightLocked->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
-                                if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {
+                            BTreeNode* right = (BTreeNode*)bm->toPtr(parent->getChild(pos + 1));
+                            node->removeSlot(slotId);
+                            if (right->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
+                                if (node->mergeNodes(pos, parent, right)) {
                                     // XXX: should reuse page Id
                                 }
                             }
                         } else {
-                            GuardX<BTreeNode> nodeLocked(move(node));
-                            parent.release();
-                            nodeLocked->removeSlot(slotId);
+                            node->removeSlot(slotId);
                         }
                         return true;
                     } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -971,58 +694,46 @@ namespace std {
                 bool updateInPlace(span<u8> key, Fn fn) {
                     for (u64 repeatCounter=0; ; repeatCounter++) {
                         try {
-                            GuardO<BTreeNode> node = findLeafO(key);
+                            BTreeNode* node = findLeafO(key);
                             bool found;
                             unsigned pos = node->lowerBound(key, found);
                             if (!found)
                                 return false;
 
                             {
-                                GuardX<BTreeNode> nodeLocked(move(node));
-                                fn(nodeLocked->getPayload(pos));
+                                fn(node->getPayload(pos));
                                 return true;
                             }
                         } catch(const OLCRestartException&) { yield(repeatCounter); }
                     }
                 }
 
-            GuardS<BTreeNode> findLeafS(span<u8> key) {
-                for (u64 repeatCounter=0; ; repeatCounter++) {
-                    try {
-                        GuardO<MetaDataPage> meta(metadataPageId);
-                        GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
-                        meta.release();
-
-                        while (node->isInner())
-                            node = GuardO<BTreeNode>(node->lookupInner(key), node);
-
-                        return GuardS<BTreeNode>(move(node));
-                    } catch(const OLCRestartException&) { yield(repeatCounter); }
-                }
+            BTreeNode* findLeafS(span<u8> key) {
+                return findLeafO(key);
             }
 
             template<class Fn>
                 void scanAsc(span<u8> key, Fn fn) {
-                    GuardS<BTreeNode> node = findLeafS(key);
+                    BTreeNode* node = findLeafS(key);
                     bool found;
                     unsigned pos = node->lowerBound(key, found);
                     for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
                         if (pos<node->count) {
-                            if (!fn(*node.ptr, pos))
+                            if (!fn(*node, pos))
                                 return;
                             pos++;
                         } else {
                             if (!node->hasRightNeighbour())
                                 return;
                             pos = 0;
-                            node = GuardS<BTreeNode>(node->nextLeafNode);
+                            node = (BTreeNode*)bm->toPtr(node->nextLeafNode);
                         }
                     }
                 }
 
             template<class Fn>
                 void scanDesc(span<u8> key, Fn fn) {
-                    GuardS<BTreeNode> node = findLeafS(key);
+                    BTreeNode* node = findLeafS(key);
                     bool exactMatch;
                     int pos = node->lowerBound(key, exactMatch);
                     if (pos == node->count) {
@@ -1031,7 +742,7 @@ namespace std {
                     }
                     for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
                         while (pos>=0) {
-                            if (!fn(*node.ptr, pos, exactMatch))
+                            if (!fn(*node, pos, exactMatch))
                                 return;
                             pos--;
                         }

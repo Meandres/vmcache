@@ -26,7 +26,7 @@
 #include <unistd.h>
 #include <immintrin.h>
 #include "utils.hpp"
-#include "btree.hpp"
+#include "btree_transparent.hpp"
 
 namespace std{
 

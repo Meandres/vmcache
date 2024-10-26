@@ -28,7 +28,6 @@
 #include <immintrin.h>
 
 namespace std {
-
     struct PageState {
         atomic<u64> stateAndVersion;
 
