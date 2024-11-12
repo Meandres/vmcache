@@ -50,17 +50,17 @@ int main(int argc, char** argv) {
     auto systemName = "mmap";
 
     auto statFn = [&]() {
-        cout << "ts,tx,system,threads,datasize,workload,batch" << endl;
+        cout << "ts,tx,system,threads,datasize,workload" << endl;
         u64 cnt = 0;
         for (uint64_t i=0; i<runForSec; i++) {
             sleep(1);
             u64 prog = txProgress.exchange(0);
-            cout << cnt++ << "," << prog << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;
+            cout << cnt++ << "," << prog << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << endl;
         }
         keepRunning = false;
     };
 
-    if (isRndread) {
+    //if (isRndread) {
         BTree* bt = new BTree(&params);
         bt->splitOrdered = true;
 
@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
             //parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
             workerThreadId = 0;
             array<u8, 120> payload;
-            for (u64 i=begin; i<end; i++) {
+            for (u64 i=0; i<n; i++) {
                 union { u64 v1; u8 k1[sizeof(u64)]; };
                 v1 = __builtin_bswap64(i);
                 memcpy(payload.data(), k1, sizeof(u64));
@@ -109,8 +109,8 @@ int main(int argc, char** argv) {
 
         statThread.join();
         return 0;
+    /*
     }
-
     // TPC-C
     Integer warehouseCount = n;
 
@@ -172,4 +172,5 @@ int main(int argc, char** argv) {
     cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
     return 0;
+    */
 }

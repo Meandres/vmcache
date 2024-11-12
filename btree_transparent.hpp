@@ -394,8 +394,7 @@ namespace std {
             BTreeNode* nodeLeft = &tmp;
 
             u64 newPID = bm->getNextPid(); 
-            BTreeNode* nodeRight = (BTreeNode*)bm->toPtr(newPID);
-            nodeRight->isLeaf = this->isLeaf;
+            BTreeNode* nodeRight = new(bm->toPtr(newPID))BTreeNode(isLeaf);
 
             nodeLeft->setFences(getLowerFence(), sep);
             nodeRight->setFences(sep, getUpperFence());
@@ -522,8 +521,7 @@ namespace std {
                 }
                 MetaDataPage* page = (MetaDataPage*)bm->toPtr(metadataPageId);
                 u64 newPid = bm->getNextPid();
-                BTreeNode* rootNode = (BTreeNode*)bm->toPtr(newPid);
-                rootNode->isLeaf = true;
+                BTreeNode* rootNode = new(bm->toPtr(newPid))BTreeNode(true);
                 slotId = btreeslotcounter++;
                 page->roots[slotId] = newPid;
             }
@@ -577,11 +575,10 @@ namespace std {
             {
 
                 // create new root if necessary
-                if (bm->toPID(&parent) == metadataPageId) {
-                    MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(&parent);
+                if (bm->toPID(parent) == metadataPageId) {
+                    MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(parent);
                     u64 newPid = bm->getNextPid();
-                    BTreeNode* newRoot = (BTreeNode*)bm->toPtr(newPid);
-                    newRoot->isLeaf = false;
+                    BTreeNode* newRoot = new(bm->toPtr(newPid))BTreeNode(false);
                     newRoot->upperInnerNode = bm->toPID(node);
                     metaData->roots[slotId] = newPid;
                     parent = newRoot;
@@ -597,6 +594,7 @@ namespace std {
                     return;
                 }
 
+                //trySplit(node, parent, {sepKey, sepInfo.len}, sizeof(PID));
                 // must split parent to make space for separator, restart from root to do this
                 ensureSpace(parent, {sepKey, sepInfo.len}, sizeof(PID));
             }

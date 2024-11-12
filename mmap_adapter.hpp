@@ -12,6 +12,7 @@ namespace std {
         MmapRegion(params_t* params){
             int fd = open(params->path, O_RDWR);
             virtMem = (Page*)mmap(NULL, params->virtSize*gb, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
             allocCount = 1;
         }
 
