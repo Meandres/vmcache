@@ -18,7 +18,7 @@ class MersenneTwister
    uint64_t rnd();
 };
 
-static thread_local MersenneTwister mt_generator;
+static thread_local MersenneTwister mt_generator __attribute__ ((tls_model ("initial-exec")));
 
 class RandomGenerator
 {

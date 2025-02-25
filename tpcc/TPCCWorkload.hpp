@@ -1,7 +1,4 @@
 #pragma once
-#ifdef OSV
-#include "drivers/vmcache.hh"
-#endif
 #include "Schema.hpp"
 // -------------------------------------------------------------------------------------
 #include "RandomGenerator.hpp"

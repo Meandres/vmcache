@@ -23,22 +23,31 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <immintrin.h>
+#include "rte_string.hh"
+#include <bitset>
 
 #ifdef OSV
-#include "drivers/vmcache.hh"
-#include "osv/trace.hh"
-#include "osv/clock.hh"
-#include "osv/sampler.hh"
+#include <osv/cache.hh>
+#include <osv/sched.hh>
 #endif //OSV
+#ifdef LINUX
 #include "exmap.h"
+#endif // LINUX
 #include <cstring>
-__thread uint16_t workerThreadId = 0;
-__thread int32_t tpcchistorycounter = 0;
+__thread uint16_t workerThreadId __attribute__ ((tls_model ("initial-exec"))) = 0;
+__thread int32_t tpcchistorycounter __attribute__ ((tls_model ("initial-exec"))) = 0;
 #include "tpcc/TPCCWorkload.hpp"
 
 using namespace std;
 
-#ifdef LINUX
+int custom_memcmp(const void* ptr1, const void* ptr2, size_t num){
+   return memcmp(ptr1, ptr2, num);
+}
+
+void* custom_memcpy(void* dest, const void* src, size_t count){
+   return memcpy(dest, src, count);
+}
+
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -51,9 +60,10 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-static const int16_t maxWorkerThreads = 128;
-
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
+
+#ifdef LINUX
+static const int16_t maxWorkerThreads = 128;
 
 uint64_t rdtsc() {
    uint32_t hi, lo;
@@ -66,6 +76,7 @@ static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
    struct exmap_action_params params_free = { .interface = workerThreadId, .iov_len = len, .opcode = (u16)op, };
    return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
 }
+#endif // LINUX
 
 // allocate memory using huge pages
 void* allocHuge(size_t size) {
@@ -231,6 +242,7 @@ struct ResidentPageSet {
    }
 };
 
+#ifdef LINUX
 // libaio interface used to write batches of pages
 struct LibaioInterface {
    static const u64 maxIOs = 256;
@@ -272,50 +284,7 @@ struct LibaioInterface {
       assert(cnt == pages.size());
    }
 };
-
-#include <chrono>
-
-typedef chrono::duration<int64_t, ratio<1, 1000000000>> elapsed_time;
-
-enum parts{
-	allocpage,
-	readpage,
-	evictpage,
-	btreeinsert,
-	btreelookup,
-	btreescanasc,
-	btreescandesc,
-	btreeupdateinplace,
-	btreeremove,
-	findleafO,
-	guardO
-};
-static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::insert()", "BTree::lookup()", "BTree::scanAsc()", "BTree::scanDesc()", "BTree::updateInPlace()", "BTree::remove()", "BTree::findLeafO()", "GuardO constructor" };
-const unsigned parts_num = 11;
-
-mutex thread_mutex;
-__thread elapsed_time parts_time[parts_num] = {};
-__thread uint64_t parts_retry[parts_num] = {};
-__thread uint64_t parts_count[parts_num] = {};
-elapsed_time thread_aggregate_time[parts_num] = {};
-uint64_t thread_aggregate_retry[parts_num] {};
-uint64_t thread_aggregate_count[parts_num] {};
-
-void add_thread_results(){
-	lock_guard<mutex> lock(thread_mutex);
-	for(unsigned i=0; i<parts_num; i++){
-		thread_aggregate_time[i] += parts_time[i];
-		thread_aggregate_retry[i] += parts_retry[i];
-		thread_aggregate_count[i] += parts_count[i];
-	}
-}
-void print_aggregate_avg(){
-	cout << "Results of the profiling :"<<endl;
-	for(unsigned i=0; i<parts_num; i++){
-		cout << "\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
-		cout << "\t\tAverage number of retries: " << double(thread_aggregate_retry[i])/thread_aggregate_count[i] <<std::endl;
-	}
-}
+#endif // LINUX
 
 struct BufferManager {
    static const u64 mb = 1024ull * 1024;
@@ -324,8 +293,10 @@ struct BufferManager {
    u64 physSize;
    u64 virtCount;
    u64 physCount;
+   #ifdef LINUX
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
+   #endif //LINUX
 
    bool useExmap;
    int blockfd;
@@ -383,14 +354,10 @@ struct GuardO {
 
    template<class T2>
    GuardO(u64 pid, GuardO<T2>& parent)  {
-      auto start = chrono::high_resolution_clock::now();
       parent.checkVersionAndRestart();
       this->pid = pid;
       ptr = reinterpret_cast<T*>(bm.toPtr(pid));
-      auto elapsed = chrono::high_resolution_clock::now() - start;
       init();
-      parts_time[guardO]+=elapsed;
-      parts_count[guardO]++;
    }
 
    GuardO(GuardO&& other) {
@@ -416,6 +383,7 @@ struct GuardO {
             case PageState::Locked:
                break;
             case PageState::Evicted:
+               
                if (ps.tryLockX(v)) {
                   bm.handleFault(pid);
                   bm.unfixX(pid);
@@ -634,23 +602,26 @@ struct GuardS {
       }
    }
 };
-#endif //LINUX
+
 u64 envOr(const char* env, u64 value) {
    if (getenv(env))
       return atof(getenv(env));
    return value;
 }
-#ifdef LINUX
+
 BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
+   #ifdef LINUX
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
    if (blockfd == -1) {
       cerr << "cannot open BLOCK device '" << path << "'" << endl;
       exit(EXIT_FAILURE);
    }
+   #endif // LINUX
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
+   #ifdef LINUX
    useExmap = envOr("EXMAP", 0);
    if (useExmap) {
       exmapfd = open("/dev/exmap", O_RDWR);
@@ -675,6 +646,12 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
    }
+   #endif // LINUX
+   #ifdef OSV
+   createCache(physSize, 64);
+   uCacheManager->addVMA(virtAllocSize, pageSize);
+   virtMem = (Page*) uCacheManager->vmaTree->vma->start;
+   #endif // OSV
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
    for (u64 i=0; i<virtCount; i++)
@@ -682,17 +659,24 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    if (virtMem == MAP_FAILED)
       die("mmap failed");
 
+   #ifdef LINUX
    libaioInterface.reserve(maxWorkerThreads);
    for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
-   
+      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));  
+   #endif // LINUX
+
    physUsedCount = 0;
    allocCount = 1; // pid 0 reserved for meta data
    readCount = 0;
    writeCount = 0;
    batch = envOr("BATCH", 64);
 
+   #ifdef LINUX
    cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
+   #endif // LINUX
+   #ifdef OSV
+   cerr << "vmcache " << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << endl;
+   #endif // OSV
 }
 
 void BufferManager::ensureFreePages() {
@@ -702,7 +686,6 @@ void BufferManager::ensureFreePages() {
 
 // allocated new page and fix it
 Page* BufferManager::allocPage() {
-   auto start = chrono::high_resolution_clock::now();
    physUsedCount++;
    ensureFreePages();
    u64 pid = allocCount++;
@@ -712,10 +695,10 @@ Page* BufferManager::allocPage() {
    }
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
-   auto mid = chrono::high_resolution_clock::now();
    assert(succ);
    residentSet.insert(pid);
 
+   #ifdef LINUX
    if (useExmap) {
       exmapInterface[workerThreadId]->iov[0].page = pid;
       exmapInterface[workerThreadId]->iov[0].len = 1;
@@ -724,13 +707,16 @@ Page* BufferManager::allocPage() {
          ensureFreePages();
       }
    }
+   #endif // LINUX
+   #ifdef OSV
+   Buffer buffer(toPtr(pid), pageSize);
+   if(!buffer.tryMapPhys(ymap_getPage(computeOrder(pageSize)))){
+      printf("error alloc\n");
+      crash_osv();
+   }
+   #endif // OSV
    virtMem[pid].dirty = true;
    
-   auto end = chrono::high_resolution_clock::now();
-   auto elapsed = end - start;
-   parts_time[allocpage] += elapsed;
-   parts_count[allocpage]++;
-
    return virtMem + pid;
 }
 
@@ -795,17 +781,13 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
-   auto start = chrono::high_resolution_clock::now();
+   #ifdef LINUX
    if (useExmap) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
          if (ret == pageSize) {
             assert(ret == pageSize);
             readCount++;
-   	    auto end = chrono::high_resolution_clock::now();
-   	    auto elapsed = end - start;
-   	    parts_time[readpage] += elapsed;
-   	    parts_count[readpage]++;
             return;
          }
          cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
@@ -813,16 +795,21 @@ void BufferManager::readPage(PID pid) {
       }
    } else {
       int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
-      readCount++;
+      assert(ret == pageSize);
    }
-   auto end = chrono::high_resolution_clock::now();
-   auto elapsed = end - start;
-   parts_time[readpage] += elapsed;
-   parts_count[readpage]++;
+   #endif // LINUX
+   #ifdef OSV
+   Buffer buffer(toPtr(pid), pageSize);
+   if(!buffer.tryMapPhys(ymap_getPage(computeOrder(pageSize)))){
+      printf("error read map\n");
+      crash_osv();
+   }
+   uCacheManager->readPage(pid);
+   #endif // OSV
+   readCount++;
 }
 
 void BufferManager::evict() {
-   auto start = chrono::high_resolution_clock::now();
    vector<PID> toEvict;
    toEvict.reserve(batch);
    vector<PID> toWrite;
@@ -852,7 +839,12 @@ void BufferManager::evict() {
    }
 
    // 1. write dirty pages
+   #ifdef LINUX
    libaioInterface[workerThreadId].writePages(toWrite);
+   #endif
+   #ifdef OSV
+   uCacheManager->flush(toWrite);
+   #endif // OSV
    writeCount += toWrite.size();
 
    // 2. try to lock clean page candidates
@@ -864,6 +856,9 @@ void BufferManager::evict() {
 
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
+      #ifdef OSV
+      virtMem[pid].dirty = false;
+      #endif // OSV
       PageState& ps = getPageState(pid);
       u64 v = ps.stateAndVersion;
       if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
@@ -872,6 +867,7 @@ void BufferManager::evict() {
          ps.unlockS();
    }
 
+   #ifdef LINUX
    // 4. remove from page table
    if (useExmap) {
       for (u64 i=0; i<toEvict.size(); i++) {
@@ -884,6 +880,22 @@ void BufferManager::evict() {
       for (u64& pid : toEvict)
          madvise(virtMem + pid, pageSize, MADV_DONTNEED);
    }
+   #endif // LINUX
+   #ifdef OSV
+   vector<void*> toEvictAddresses;
+   toEvictAddresses.reserve(toEvict.size());
+   for(u64 pid: toEvict){
+      Buffer buffer(toPtr(pid), pageSize);
+      u64 frame = buffer.tryUnmapPhys();
+      assert(frame != 0);
+      ymap_putPage(frame, computeOrder(pageSize));
+      toEvictAddresses.push_back(toPtr(pid));
+   }
+   if(toEvictAddresses.size() < 64)
+      mmu::invlpg_tlb_all(toEvictAddresses);
+   else
+      mmu::flush_tlb_all();
+   #endif // OSV
 
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
@@ -893,10 +905,6 @@ void BufferManager::evict() {
    }
 
    physUsedCount -= toEvict.size();
-   auto end = chrono::high_resolution_clock::now();
-   auto elapsed = end - start;
-   parts_time[evictpage] += elapsed;
-   parts_count[evictpage]++;
 }
 
 //---------------------------------------------------------------------------
@@ -948,7 +956,7 @@ template <class T>
 static T loadUnaligned(void* p)
 {
    T x;
-   memcpy(&x, p, sizeof(T));
+   custom_memcpy(&x, p, sizeof(T));
    return x;
 }
 
@@ -1052,7 +1060,7 @@ struct BTreeNode : public BTreeNodeHeader {
       foundExactOut = false;
 
       // check prefix
-      int cmp = memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
+      int cmp = custom_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
       if (cmp < 0) // key is less than prefix
          return 0;
       if (cmp > 0) // key is greater than prefix
@@ -1076,7 +1084,7 @@ struct BTreeNode : public BTreeNodeHeader {
          } else if (keyHead > slot[mid].head) {
             lower = mid + 1;
          } else { // head is equal, check full key
-            int cmp = memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
+            int cmp = custom_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
             if (cmp < 0) {
                upper = mid;
             } else if (cmp > 0) {
@@ -1139,7 +1147,7 @@ struct BTreeNode : public BTreeNodeHeader {
 
    void copyNode(BTreeNodeHeader* dst, BTreeNodeHeader* src) {
       u64 ofs = offsetof(BTreeNodeHeader, upperInnerNode);
-      memcpy(reinterpret_cast<u8*>(dst)+ofs, reinterpret_cast<u8*>(src)+ofs, sizeof(BTreeNode)-ofs);
+      custom_memcpy(reinterpret_cast<u8*>(dst)+ofs, reinterpret_cast<u8*>(src)+ofs, sizeof(BTreeNode)-ofs);
    }
 
    void compactify()
@@ -1175,7 +1183,7 @@ struct BTreeNode : public BTreeNodeHeader {
       copyKeyValueRange(&tmp, 0, 0, count);
       right->copyKeyValueRange(&tmp, count, 0, right->count);
       PID pid = bm.toPID(this);
-      memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
+      custom_memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
       parent->removeSlot(slotId);
       tmp.makeHint();
       tmp.nextLeafNode = right->nextLeafNode;
@@ -1190,6 +1198,9 @@ struct BTreeNode : public BTreeNodeHeader {
       // slot
       u8* key = skey.data() + prefixLen;
       unsigned keyLen = skey.size() - prefixLen;
+      if(keyLen > 4096){
+         printf("skey: %lu, prefixLen: %lu\n", skey.size(), prefixLen);
+      }
       slot[slotId].head = head(key, keyLen);
       slot[slotId].keyLen = keyLen;
       slot[slotId].payloadLen = payload.size();
@@ -1199,8 +1210,8 @@ struct BTreeNode : public BTreeNodeHeader {
       spaceUsed += space;
       slot[slotId].offset = dataOffset;
       assert(getKey(slotId) >= reinterpret_cast<u8*>(&slot[slotId]));
-      memcpy(getKey(slotId), key, keyLen);
-      memcpy(getPayload(slotId).data(), payload.data(), payload.size());
+      custom_memcpy(getKey(slotId), key, keyLen);
+      custom_memcpy(getPayload(slotId).data(), payload.data(), payload.size());
    }
 
    void copyKeyValueRange(BTreeNode* dst, u16 dstSlot, u16 srcSlot, unsigned srcCount)
@@ -1214,7 +1225,7 @@ struct BTreeNode : public BTreeNodeHeader {
             dst->spaceUsed += space;
             dst->slot[dstSlot + i].offset = dst->dataOffset;
             u8* key = getKey(srcSlot + i) + diff;
-            memcpy(dst->getKey(dstSlot + i), key, space);
+            custom_memcpy(dst->getKey(dstSlot + i), key, space);
             dst->slot[dstSlot + i].head = head(key, newKeyLen);
             dst->slot[dstSlot + i].keyLen = newKeyLen;
             dst->slot[dstSlot + i].payloadLen = slot[srcSlot + i].payloadLen;
@@ -1231,8 +1242,8 @@ struct BTreeNode : public BTreeNodeHeader {
    {
       unsigned fullLen = slot[srcSlot].keyLen + prefixLen;
       u8 key[fullLen];
-      memcpy(key, getPrefix(), prefixLen);
-      memcpy(key+prefixLen, getKey(srcSlot), slot[srcSlot].keyLen);
+      custom_memcpy(key, getPrefix(), prefixLen);
+      custom_memcpy(key+prefixLen, getKey(srcSlot), slot[srcSlot].keyLen);
       dst->storeKeyValue(dstSlot, {key, fullLen}, getPayload(srcSlot));
    }
 
@@ -1243,7 +1254,7 @@ struct BTreeNode : public BTreeNodeHeader {
       spaceUsed += key.size();
       fk.offset = dataOffset;
       fk.len = key.size();
-      memcpy(ptr() + dataOffset, key.data(), key.size());
+      custom_memcpy(ptr() + dataOffset, key.data(), key.size());
    }
 
    void setFences(span<u8> lower, span<u8> upper)
@@ -1275,7 +1286,7 @@ struct BTreeNode : public BTreeNodeHeader {
          parent->upperInnerNode = newNode.pid;
       } else {
          assert(parent->getChild(oldParentSlot) == leftPID);
-         memcpy(parent->getPayload(oldParentSlot).data(), &newNode.pid, sizeof(PID));
+         custom_memcpy(parent->getPayload(oldParentSlot).data(), &newNode.pid, sizeof(PID));
       }
       parent->insertInPage(sep, {reinterpret_cast<u8*>(&leftPID), sizeof(PID)});
 
@@ -1353,8 +1364,8 @@ struct BTreeNode : public BTreeNodeHeader {
 
    void getSep(u8* sepKeyOut, SeparatorInfo info)
    {
-      memcpy(sepKeyOut, getPrefix(), prefixLen);
-      memcpy(sepKeyOut + prefixLen, getKey(info.slot + info.isTruncated), info.len - prefixLen);
+      custom_memcpy(sepKeyOut, getPrefix(), prefixLen);
+      custom_memcpy(sepKeyOut + prefixLen, getKey(info.slot + info.isTruncated), info.len - prefixLen);
    }
 
    PID lookupInner(span<u8> key)
@@ -1391,16 +1402,12 @@ struct BTree {
    ~BTree();
 
    GuardO<BTreeNode> findLeafO(span<u8> key) {
-      auto start = chrono::high_resolution_clock::now();
       GuardO<MetaDataPage> meta(metadataPageId);
       GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
       meta.release();
 
       while (node->isInner())
          node = GuardO<BTreeNode>(node->lookupInner(key), node);
-      auto elapsed = chrono::high_resolution_clock::now() - start;
-      parts_time[findleafO] += elapsed;
-      parts_count[findleafO]++;
       return node;
    }
 
@@ -1415,7 +1422,7 @@ struct BTree {
                return -1;
 
             // key found, copy payload
-            memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
+            custom_memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
             return node->slot[pos].payloadLen;
          } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
@@ -1423,26 +1430,16 @@ struct BTree {
 
    template<class Fn>
    bool lookup(span<u8> key, Fn fn) {
-   auto start = chrono::high_resolution_clock::now();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
-            if (!found){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreelookup] += elapsed;
-   		parts_retry[btreelookup] += repeatCounter;
-   		parts_count[btreelookup]++;
+            if (!found)
                return false;
-	    }
 
             // key found
             fn(node->getPayload(pos));
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreelookup] += elapsed;
-   		parts_retry[btreelookup] += repeatCounter;
-   		parts_count[btreelookup]++;
             return true;
          } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
@@ -1453,27 +1450,17 @@ struct BTree {
 
    template<class Fn>
    bool updateInPlace(span<u8> key, Fn fn) {
-      auto start = chrono::high_resolution_clock::now();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
-            if (!found){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreeupdateinplace] += elapsed;
-   		parts_retry[btreeupdateinplace] += repeatCounter;
-   		parts_count[btreeupdateinplace]++;
+            if (!found)
                return false;
-	    }
 
             {
                GuardX<BTreeNode> nodeLocked(move(node));
                fn(nodeLocked->getPayload(pos));
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreeupdateinplace] += elapsed;
-   		parts_retry[btreeupdateinplace] += repeatCounter;
-   		parts_count[btreeupdateinplace]++;
                return true;
             }
          } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -1497,28 +1484,17 @@ struct BTree {
 
    template<class Fn>
    void scanAsc(span<u8> key, Fn fn) {
-      auto start = chrono::high_resolution_clock::now();
       GuardS<BTreeNode> node = findLeafS(key);
       bool found;
       unsigned pos = node->lowerBound(key, found);
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          if (pos<node->count) {
-            if (!fn(*node.ptr, pos)){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreescanasc] += elapsed;
-   		parts_retry[btreescanasc] += repeatCounter;
-   		parts_count[btreescanasc]++;
+            if (!fn(*node.ptr, pos))
                return;
-	    }
             pos++;
          } else {
-            if (!node->hasRightNeighbour()){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreescanasc] += elapsed;
-   		parts_retry[btreescanasc] += repeatCounter;
-   		parts_count[btreescanasc]++;
+            if (!node->hasRightNeighbour())
                return;
-	    }
             pos = 0;
             node = GuardS<BTreeNode>(node->nextLeafNode);
          }
@@ -1527,7 +1503,6 @@ struct BTree {
 
    template<class Fn>
    void scanDesc(span<u8> key, Fn fn) {
-      auto start = chrono::high_resolution_clock::now();
       GuardS<BTreeNode> node = findLeafS(key);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
@@ -1537,22 +1512,12 @@ struct BTree {
       }
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          while (pos>=0) {
-            if (!fn(*node.ptr, pos, exactMatch)){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreescandesc] += elapsed;
-   		parts_retry[btreescandesc] += repeatCounter;
-   		parts_count[btreescandesc]++;
+            if (!fn(*node.ptr, pos, exactMatch))
                return;
-	    }
             pos--;
          }
-         if (!node->hasLowerFence()){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreescandesc] += elapsed;
-   		parts_retry[btreescandesc] += repeatCounter;
-   		parts_count[btreescandesc]++;
+         if (!node->hasLowerFence())
             return;
-	 }
          node = findLeafS(node->getLowerFence());
          pos = node->count-1;
       }
@@ -1623,7 +1588,6 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
 
 void BTree::insert(span<u8> key, span<u8> payload)
 {
-   auto start = chrono::high_resolution_clock::now();
    assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
 
    for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -1641,10 +1605,6 @@ void BTree::insert(span<u8> key, span<u8> payload)
             GuardX<BTreeNode> nodeLocked(move(node));
             parent.release();
             nodeLocked->insertInPage(key, payload);
-   	    auto elapsed = chrono::high_resolution_clock::now() - start;
-	    parts_time[btreeinsert] += elapsed;
-   	    parts_retry[btreeinsert] += repeatCounter;
-	    parts_count[btreeinsert]++;
             return; // success
          }
 
@@ -1659,7 +1619,6 @@ void BTree::insert(span<u8> key, span<u8> payload)
 
 bool BTree::remove(span<u8> key)
 {
-   auto start = chrono::high_resolution_clock::now();
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
          GuardO<BTreeNode> parent(metadataPageId);
@@ -1675,13 +1634,8 @@ bool BTree::remove(span<u8> key)
 
          bool found;
          unsigned slotId = node->lowerBound(key, found);
-         if (!found){
-   		auto elapsed = chrono::high_resolution_clock::now() - start;
-   		parts_time[btreeremove] += elapsed;
-   	        parts_retry[btreeremove] += repeatCounter;
-		parts_count[btreeremove]++;
+         if (!found)
             return false;
-	 }
 
          unsigned sizeEntry = node->slot[slotId].keyLen + node->slot[slotId].payloadLen;
          if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (parent.pid != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
@@ -1700,17 +1654,13 @@ bool BTree::remove(span<u8> key)
             parent.release();
             nodeLocked->removeSlot(slotId);
          }
-   	auto elapsed = chrono::high_resolution_clock::now() - start;
-   	parts_time[btreeremove] += elapsed;
-   	parts_retry[btreeremove] += repeatCounter;
-	parts_count[btreeremove]++;
          return true;
       } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
-#endif //linux
 typedef u64 KeyType;
 
+#ifdef LINUX
 void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
    void* page = info->si_addr;
    if (bm.isValidPtr(page)) {
@@ -1721,6 +1671,7 @@ void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
       _exit(1);
    }
 }
+#endif // LINUX
 
 template <class Record>
 struct vmcacheAdapter
@@ -1733,17 +1684,12 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       u8 kk[Record::maxFoldLength()];
       tree.scanAsc({k, l}, [&](BTreeNode& node, unsigned slot) {
-         memcpy(kk, node.getPrefix(), node.prefixLen);
-         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+         custom_memcpy(kk, node.getPrefix(), node.prefixLen);
+         custom_memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
-#ifdef OSV
-      }, workerThreadId);
-#endif
-#ifdef LINUX
       });
-#endif
    }
    // -------------------------------------------------------------------------------------
    void scanDesc(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
@@ -1757,28 +1703,18 @@ struct vmcacheAdapter
             if (!exactMatch)
                return true;
          }
-         memcpy(kk, node.getPrefix(), node.prefixLen);
-         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+         custom_memcpy(kk, node.getPrefix(), node.prefixLen);
+         custom_memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
-#ifdef OSV
-      }, workerThreadId);
-#endif
-#ifdef LINUX
       });
-#endif
    }
    // -------------------------------------------------------------------------------------
    void insert(const typename Record::Key& key, const Record& record) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
-#ifdef OSV
-      tree.insert({k, l}, {(u8*)(&record), sizeof(Record)}, workerThreadId);
-#endif
-#ifdef LINUX
       tree.insert({k, l}, {(u8*)(&record), sizeof(Record)});
-#endif
    }
    // -------------------------------------------------------------------------------------
    template<class Fn>
@@ -1787,12 +1723,7 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       bool succ = tree.lookup({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<const Record*>(payload.data()));
-#ifdef OSV
-      }, workerThreadId);
-#endif
-#ifdef LINUX
       });
-#endif
       assert(succ);
    }
    // -------------------------------------------------------------------------------------
@@ -1802,24 +1733,14 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       tree.updateInPlace({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<Record*>(payload.data()));
-#ifdef OSV
-      }, workerThreadId);
-#endif
-#ifdef LINUX
       });
-#endif
    }
    // -------------------------------------------------------------------------------------
    // Returns false if the record was not found
    bool erase(const typename Record::Key& key) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
-#ifdef OSV
-      return tree.remove({k, l}, workerThreadId);
-#endif
-#ifdef LINUX
       return tree.remove({k, l});
-#endif
    }
    // -------------------------------------------------------------------------------------
    template <class Field>
@@ -1831,12 +1752,7 @@ struct vmcacheAdapter
 
    u64 count() {
       u64 cnt = 0;
-#ifdef OSV
-      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; }, workerThreadId);
-#endif
-#ifdef LINUX
       tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; });
-#endif
       return cnt;
    }
 
@@ -1846,18 +1762,13 @@ struct vmcacheAdapter
       u64 cnt = 0;
       u8 kk[Record::maxFoldLength()];
       tree.scanAsc({k, sizeof(Integer)}, [&](BTreeNode& node, unsigned slot) {
-         memcpy(kk, node.getPrefix(), node.prefixLen);
-         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
-         if (memcmp(k, kk, sizeof(Integer))!=0)
+         custom_memcpy(kk, node.getPrefix(), node.prefixLen);
+         custom_memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+         if (custom_memcmp(k, kk, sizeof(Integer))!=0)
             return false;
          cnt++;
          return true;
-#ifdef OSV
-      }, workerThreadId);
-#endif
-#ifdef LINUX
       });
-#endif
       return cnt;
    }
 };
@@ -1880,10 +1791,9 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    uint64_t perThread = n/nthreads;
    for (unsigned i=0; i<nthreads; i++) {
       threads.emplace_back([&,i]() {
-        pin_thread_to_core(i);
+         pin_thread_to_core(i);
          uint64_t b = (perThread*i) + begin;
-         //uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
-         uint64_t e = b+perThread;
+         uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
          fn(i, b, e);
       });
    }
@@ -1891,26 +1801,8 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       t.join();
 }
 
-
-__thread u64 loadCount = 0;
-
 int main(int argc, char** argv) {
-	/*cout << "BLBL" << std::endl;
-	double x=42;
-	//auto start = osv::clock::uptime::now();
-    	//auto start = chrono::high_resolution_clock::now();
-	for(int i=0; i<10000000; i++){
-		x=cos(x) + chrono::duration_cast<chrono::milliseconds>(osv::clock::uptime::now()-start).count();
-	}
-	auto elapsed = osv::clock::uptime::now() - start;
-	//auto elapsed = chrono::high_resolution_clock::now() - start;
-	cout << "Total time for the insertion : " << chrono::duration_cast<chrono::milliseconds>(elapsed).count() << " s" << x << endl;
-	return 0;
-*/
-#ifdef OSV
-   cout << "ACHTUNG : maxWorkerThreads is " << maxWorkerThreads << ", maxQueues is " << maxQueues << endl;
-   #endif //OSV
-#ifdef LINUX
+   #ifdef LINUX
    if (bm.useExmap) {
       struct sigaction action;
       action.sa_flags = SA_SIGINFO;
@@ -1920,8 +1812,11 @@ int main(int argc, char** argv) {
          exit(1);
       }
    }
-#endif
    unsigned nthreads = envOr("THREADS", 1);
+   #endif
+   #ifdef OSV
+   unsigned nthreads = sched::cpus.size();
+   #endif // OSV
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
@@ -1932,20 +1827,18 @@ int main(int argc, char** argv) {
 #ifdef LINUX
    auto systemName = bm.useExmap ? "exmap" : "linux";
 #else
-   auto systemName = "osv";
+   auto systemName = "uCache";
 #endif
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,pagesStolen,system,threads,datasize,workload,batch" << endl;
+      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (bm.readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-	 u64 nbPagesStolen = 0;//pagesStolen.exchange(0);
-         //cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << nbPagesStolen << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << nbPagesStolen << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
       }
       keepRunning = false;
    };
@@ -1962,13 +1855,8 @@ int main(int argc, char** argv) {
             for (u64 i=begin; i<end; i++) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
-               memcpy(payload.data(), k1, sizeof(u64));
-#ifdef OSV
-               bt.insert({k1, sizeof(KeyType)}, payload, workerThreadId);
-#endif
-#ifdef LINUX
+               custom_memcpy(payload.data(), k1, sizeof(u64));
                bt.insert({k1, sizeof(KeyType)}, payload);
-#endif
             }
          });
       }
@@ -1988,15 +1876,10 @@ int main(int argc, char** argv) {
 
             array<u8, 120> payload; 
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-		memcpy(payload.data(), p.data(), p.size());
-#ifdef OSV
-            }, workerThreadId);
-#endif
-#ifdef LINUX
+		           custom_memcpy(payload.data(), p.data(), p.size());
             });
-#endif
             assert(succ);
-            assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+            assert(custom_memcmp(k1, payload.data(), sizeof(u64))==0);
 
             cnt++;
             u64 stop = rdtsc();
@@ -2029,13 +1912,6 @@ int main(int argc, char** argv) {
    vmcacheAdapter<stock_t> stock;
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
-   #ifdef OSV
-   //prof::config config{std::chrono::nanoseconds(1000000)};
-   //prof::start_sampler(config);
-   #endif //OSV
-   #ifdef LINUX
-   //auto start = chrono::high_resolution_clock::now();
-   #endif //LINUX
    {
       tpcc.loadItem();
       tpcc.loadWarehouse();
@@ -2044,26 +1920,14 @@ int main(int argc, char** argv) {
          for (Integer w_id=begin; w_id<end; w_id++) {
             tpcc.loadStock(w_id);
             tpcc.loadDistrinct(w_id);
-	    cout << "loading "<< w_id <<endl;
             for (Integer d_id = 1; d_id <= 10; d_id++) {
                 tpcc.loadCustomer(w_id, d_id);
                 tpcc.loadOrders(w_id, d_id);
-		//cout << "\t"<< d_id <<endl;
             }
          }
-	add_thread_results();
       });
    }
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-   #ifdef OSV
-   //auto end = osv::clock::uptime::now();
-   #endif //OSV
-   #ifdef LINUX
-   auto end = chrono::high_resolution_clock::now();
-   #endif //LINUX
-   //cout << "Total time for the insertion : " << chrono::duration_cast<chrono::seconds>(end-start).count() << " s" << endl;
-   //print_aggregate_avg();
-   //return 0;
    bm.readCount = 0;
    bm.writeCount = 0;
    thread statThread(statFn);
@@ -2084,15 +1948,9 @@ int main(int argc, char** argv) {
          }
       }
       txProgress += cnt;
-      add_thread_results();
    });
 
-#ifdef OSV
-   //prof::stop_sampler();
-#endif
    statThread.join();
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-   print_aggregate_avg();
-
    return 0;
 }
