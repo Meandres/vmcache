@@ -41,11 +41,11 @@ __thread int32_t tpcchistorycounter __attribute__ ((tls_model ("initial-exec")))
 using namespace std;
 
 int custom_memcmp(const void* ptr1, const void* ptr2, size_t num){
-   return memcmp(ptr1, ptr2, num);
+   return rte_memcmp(ptr1, ptr2, num);
 }
 
 void* custom_memcpy(void* dest, const void* src, size_t count){
-   return memcpy(dest, src, count);
+   return rte_memcpy(dest, src, count);
 }
 
 typedef uint8_t u8;
