@@ -27,7 +27,7 @@
 #include <bitset>
 
 #ifdef OSV
-#include <osv/cache.hh>
+#include <osv/ucache.hh>
 #include <osv/sched.hh>
 #endif //OSV
 #ifdef LINUX
@@ -297,6 +297,9 @@ struct BufferManager {
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
    #endif //LINUX
+   #ifdef OSV
+   ucache::VMA* ucache_vma;
+   #endif // OSV
 
    bool useExmap;
    int blockfd;
@@ -609,6 +612,15 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
+#ifdef OSV
+bool vmcache_isDirty(ucache::Buffer* buf, int id){
+   return bm.virtMem[bm.toPID(buf->baseVirt)].dirty;
+}
+void vmcache_setClean(ucache::Buffer* buf, int id){
+   bm.virtMem[bm.toPID(buf->baseVirt)].dirty = false;
+}
+#endif //OSV
+
 BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
    #ifdef LINUX
@@ -648,9 +660,11 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    }
    #endif // LINUX
    #ifdef OSV
-   createCache(physSize, 64);
-   uCacheManager->addVMA(virtAllocSize, pageSize);
-   virtMem = (Page*) uCacheManager->vmaTree->vma->start;
+   ucache::createCache(physSize, 64);
+   virtMem = (Page*)ucache::uCacheManager->addVMA(virtAllocSize, pageSize);
+   ucache_vma = ucache::uCacheManager->getVMA((void*)virtMem);
+   ucache_vma->isDirty_implem = vmcache_isDirty;
+   ucache_vma->setClean_implem = vmcache_setClean;
    #endif // OSV
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
@@ -709,10 +723,10 @@ Page* BufferManager::allocPage() {
    }
    #endif // LINUX
    #ifdef OSV
-   Buffer buffer(toPtr(pid), pageSize);
-   if(!buffer.tryMapPhys(ymap_getPage(computeOrder(pageSize)))){
+   ucache::Buffer buffer(toPtr(pid), pageSize, ucache_vma);
+   if(!buffer.tryMapPhys(ucache::frames_alloc_phys_addr(pageSize))){
       printf("error alloc\n");
-      crash_osv();
+      ucache::crash_osv();
    }
    #endif // OSV
    virtMem[pid].dirty = true;
@@ -799,17 +813,18 @@ void BufferManager::readPage(PID pid) {
    }
    #endif // LINUX
    #ifdef OSV
-   Buffer buffer(toPtr(pid), pageSize);
-   if(!buffer.tryMapPhys(ymap_getPage(computeOrder(pageSize)))){
+   ucache::Buffer buffer(toPtr(pid), pageSize, ucache_vma);
+   if(!buffer.tryMapPhys(ucache::frames_alloc_phys_addr(pageSize))){
       printf("error read map\n");
-      crash_osv();
+      ucache::crash_osv();
    }
-   uCacheManager->readPage(pid);
+   ucache::uCacheManager->readBuffer(&buffer);
    #endif // OSV
    readCount++;
 }
 
 void BufferManager::evict() {
+   #ifdef LINUX
    vector<PID> toEvict;
    toEvict.reserve(batch);
    vector<PID> toWrite;
@@ -839,12 +854,7 @@ void BufferManager::evict() {
    }
 
    // 1. write dirty pages
-   #ifdef LINUX
    libaioInterface[workerThreadId].writePages(toWrite);
-   #endif
-   #ifdef OSV
-   uCacheManager->flush(toWrite);
-   #endif // OSV
    writeCount += toWrite.size();
 
    // 2. try to lock clean page candidates
@@ -856,9 +866,6 @@ void BufferManager::evict() {
 
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
-      #ifdef OSV
-      virtMem[pid].dirty = false;
-      #endif // OSV
       PageState& ps = getPageState(pid);
       u64 v = ps.stateAndVersion;
       if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
@@ -867,7 +874,6 @@ void BufferManager::evict() {
          ps.unlockS();
    }
 
-   #ifdef LINUX
    // 4. remove from page table
    if (useExmap) {
       for (u64 i=0; i<toEvict.size(); i++) {
@@ -880,23 +886,7 @@ void BufferManager::evict() {
       for (u64& pid : toEvict)
          madvise(virtMem + pid, pageSize, MADV_DONTNEED);
    }
-   #endif // LINUX
-   #ifdef OSV
-   vector<void*> toEvictAddresses;
-   toEvictAddresses.reserve(toEvict.size());
-   for(u64 pid: toEvict){
-      Buffer buffer(toPtr(pid), pageSize);
-      u64 frame = buffer.tryUnmapPhys();
-      assert(frame != 0);
-      ymap_putPage(frame, computeOrder(pageSize));
-      toEvictAddresses.push_back(toPtr(pid));
-   }
-   if(toEvictAddresses.size() < 64)
-      mmu::invlpg_tlb_all(toEvictAddresses);
-   else
-      mmu::flush_tlb_all();
-   #endif // OSV
-
+   
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
       bool succ = residentSet.remove(pid);
@@ -905,6 +895,91 @@ void BufferManager::evict() {
    }
 
    physUsedCount -= toEvict.size();
+   #endif // LINUX
+   #ifdef OSV 
+   vector<ucache::Buffer*> toEvict;
+   vector<ucache::Buffer*> toWrite;
+   toEvict.reserve(batch);
+   toWrite.reserve(batch);
+   
+   // 0. find candidates, lock dirty ones in shared mode
+   while (toEvict.size() + toWrite.size() < batch) {
+      residentSet.iterateClockBatch(batch, [&](PID pid) {
+         PageState& ps = getPageState(pid);
+         u64 v = ps.stateAndVersion;
+         switch (PageState::getState(v)) {
+            ucache::Buffer* buffer;
+            case PageState::Marked:
+               buffer = new ucache::Buffer(toPtr(pid), pageSize, ucache_vma);
+               if (virtMem[pid].dirty) {
+                  if (ps.tryLockS(v))
+                     toWrite.push_back(buffer);
+                  else
+                     delete buffer;
+               }else
+                  toEvict.push_back(buffer);
+               break;
+            case PageState::Unlocked:
+               ps.tryMark(v);
+               break;
+            default:
+               break; // skip
+         };
+      });
+   }
+   
+   // 1. write dirty pages
+   ucache::uCacheManager->flush(toWrite);
+   writeCount += toWrite.size();
+
+   // 2. try to lock clean page candidates
+   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](ucache::Buffer* buf) {
+      PID pid = toPID(buf->baseVirt);
+      PageState& ps = getPageState(pid);
+      u64 v = ps.stateAndVersion;
+      if((PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v)){
+         delete buf;
+         return true;
+      }
+      return false;
+   }), toEvict.end());
+
+   // 3. try to upgrade lock for dirty page candidates
+   for (ucache::Buffer* buf : toWrite) {
+      PID pid = toPID(buf->baseVirt);
+      PageState& ps = getPageState(pid);
+      u64 v = ps.stateAndVersion;
+      if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
+         toEvict.push_back(buf);
+      else{
+         ps.unlockS();
+         delete buf;
+      }
+   }
+
+   // 4. remove from page table
+   for(ucache::Buffer* buf: toEvict){
+      u64 frame = buf->tryUnmapPhys();
+      if(frame == 0){
+         ucache::crash_osv();
+      }
+      ucache::frames_free_phys_addr(frame, pageSize);
+   }
+   if(toEvict.size() < 0)
+      ucache::invlpg_tlb_all(toEvict);
+   else
+      mmu::flush_tlb_all();
+
+   // 5. remove from hash table and unlock
+   for (ucache::Buffer* buf : toEvict) {
+      PID pid = toPID(buf->baseVirt);
+      bool succ = residentSet.remove(pid);
+      assert(succ);
+      getPageState(pid).unlockXEvicted();
+      delete buf;
+   }
+   physUsedCount -= toEvict.size();
+   #endif // OSV
 }
 
 //---------------------------------------------------------------------------
@@ -1198,9 +1273,6 @@ struct BTreeNode : public BTreeNodeHeader {
       // slot
       u8* key = skey.data() + prefixLen;
       unsigned keyLen = skey.size() - prefixLen;
-      if(keyLen > 4096){
-         printf("skey: %lu, prefixLen: %lu\n", skey.size(), prefixLen);
-      }
       slot[slotId].head = head(key, keyLen);
       slot[slotId].keyLen = keyLen;
       slot[slotId].payloadLen = payload.size();
