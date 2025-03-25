@@ -1870,7 +1870,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       threads.emplace_back([&,i]() {
          pin_thread_to_core(i);
          uint64_t b = (perThread*i) + begin;
-         uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+         uint64_t e = (i==(nthreads-1)) ? end : (b+perThread);
          fn(i, b, e);
       });
    }
