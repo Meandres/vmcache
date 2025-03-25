@@ -77,6 +77,11 @@ static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
    return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
 }
 #endif // LINUX
+#ifdef OSV
+uint64_t rdtsc(){
+   return processor::rdtsc();
+}
+#endif // OSV
 
 // allocate memory using huge pages
 void* allocHuge(size_t size) {
