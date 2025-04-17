@@ -618,10 +618,10 @@ u64 envOr(const char* env, u64 value) {
 }
 
 #ifdef OSV
-bool vmcache_isDirty(ucache::Buffer* buf, int id){
+bool vmcache_isDirty(ucache::Buffer* buf){
    return bm.virtMem[bm.toPID(buf->baseVirt)].dirty;
 }
-void vmcache_setClean(ucache::Buffer* buf, int id){
+void vmcache_setClean(ucache::Buffer* buf){
    bm.virtMem[bm.toPID(buf->baseVirt)].dirty = false;
 }
 #endif //OSV
@@ -668,8 +668,8 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    ucache::createCache(physSize, 64);
    virtMem = (Page*)ucache::uCacheManager->addVMA(virtAllocSize, pageSize);
    ucache_vma = ucache::uCacheManager->getVMA((void*)virtMem);
-   ucache_vma->isDirty_implem = vmcache_isDirty;
-   ucache_vma->setClean_implem = vmcache_setClean;
+   ucache_vma->callback_implems.isDirty_implem = vmcache_isDirty;
+   ucache_vma->callback_implems.clearDirty_implem = vmcache_setClean;
    #endif // OSV
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
@@ -729,10 +729,14 @@ Page* BufferManager::allocPage() {
    #endif // LINUX
    #ifdef OSV
    ucache::Buffer buffer(toPtr(pid), pageSize, ucache_vma);
-   if(!buffer.tryMapPhys(ucache::frames_alloc_phys_addr(pageSize))){
+   ucache::BufferSnapshot bs(ucache_vma->nbPages);
+   buffer.updateSnapshot(&bs);
+   bs.state = ucache::BufferState::Inserting;
+   if(!buffer.UncachedToInserting(ucache::frames_alloc_phys_addr(pageSize), &bs)){
       printf("error alloc\n");
       ucache::crash_osv();
    }
+   ucache::assert_crash(buffer.InsertingToCached(&bs));
    #endif // OSV
    virtMem[pid].dirty = true;
    
@@ -819,11 +823,15 @@ void BufferManager::readPage(PID pid) {
    #endif // LINUX
    #ifdef OSV
    ucache::Buffer buffer(toPtr(pid), pageSize, ucache_vma);
-   if(!buffer.tryMapPhys(ucache::frames_alloc_phys_addr(pageSize))){
+   ucache::BufferSnapshot bs(ucache_vma->nbPages);
+   buffer.updateSnapshot(&bs);
+   bs.state = ucache::BufferState::Inserting;
+   if(!buffer.UncachedToInserting(ucache::frames_alloc_phys_addr(pageSize), &bs)){
       printf("error read map\n");
       ucache::crash_osv();
    }
    ucache::uCacheManager->readBuffer(&buffer);
+   ucache::assert_crash(buffer.InsertingToCached(&bs));
    #endif // OSV
    readCount++;
 }
@@ -914,15 +922,25 @@ void BufferManager::evict() {
          u64 v = ps.stateAndVersion;
          switch (PageState::getState(v)) {
             ucache::Buffer* buffer;
+            ucache::BufferSnapshot* bs;
             case PageState::Marked:
                buffer = new ucache::Buffer(toPtr(pid), pageSize, ucache_vma);
+               bs = new ucache::BufferSnapshot(ucache_vma->nbPages);
+               buffer->updateSnapshot(bs);
                if (virtMem[pid].dirty) {
-                  if (ps.tryLockS(v))
+                  if (ps.tryLockS(v)){
+                     buffer->snap = bs;
+                     bs->state = ucache::BufferState::Evicting;
                      toWrite.push_back(buffer);
-                  else
+                  }else{
+                     delete bs;
                      delete buffer;
-               }else
+                  }
+               }else{
+                  buffer->snap = bs;
+                  bs->state = ucache::BufferState::Evicting;
                   toEvict.push_back(buffer);
+               }
                break;
             case PageState::Unlocked:
                ps.tryMark(v);
@@ -962,16 +980,20 @@ void BufferManager::evict() {
       }
    }
 
+   std::vector<void*> addressesToInvlpg;
+   addressesToInvlpg.reserve(toEvict.size());
    // 4. remove from page table
    for(ucache::Buffer* buf: toEvict){
-      u64 frame = buf->tryUnmapPhys();
+      buf->updateSnapshot(buf->snap);
+      u64 frame = buf->EvictingToUncached(buf->snap);
       if(frame == 0){
          ucache::crash_osv();
       }
+      addressesToInvlpg.push_back(buf->baseVirt);
       ucache::frames_free_phys_addr(frame, pageSize);
    }
    if(toEvict.size() < 0)
-      ucache::invlpg_tlb_all(toEvict);
+      mmu::invlpg_tlb_all(&addressesToInvlpg);
    else
       mmu::flush_tlb_all();
 
@@ -981,6 +1003,7 @@ void BufferManager::evict() {
       bool succ = residentSet.remove(pid);
       assert(succ);
       getPageState(pid).unlockXEvicted();
+      delete buf->snap;
       delete buf;
    }
    physUsedCount -= toEvict.size();

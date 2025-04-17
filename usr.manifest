@@ -1,2 +1,2 @@
-/vmcache_eval: ${MODULE_DIR}/vmcache_eval
+/vmcache: ${MODULE_DIR}/vmcache_eval
 /nvme_files.txt: ${MODULE_DIR}/nvme_files.txt
