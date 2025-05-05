@@ -731,7 +731,6 @@ Page* BufferManager::allocPage() {
    ucache::Buffer buffer(toPtr(pid), pageSize, ucache_vma);
    ucache::BufferSnapshot bs(ucache_vma->nbPages);
    buffer.updateSnapshot(&bs);
-   bs.state = ucache::BufferState::Inserting;
    if(!buffer.UncachedToInserting(ucache::frames_alloc_phys_addr(pageSize), &bs)){
       printf("error alloc\n");
       ucache::crash_osv();
@@ -825,7 +824,6 @@ void BufferManager::readPage(PID pid) {
    ucache::Buffer buffer(toPtr(pid), pageSize, ucache_vma);
    ucache::BufferSnapshot bs(ucache_vma->nbPages);
    buffer.updateSnapshot(&bs);
-   bs.state = ucache::BufferState::Inserting;
    if(!buffer.UncachedToInserting(ucache::frames_alloc_phys_addr(pageSize), &bs)){
       printf("error read map\n");
       ucache::crash_osv();
@@ -929,8 +927,8 @@ void BufferManager::evict() {
                buffer->updateSnapshot(bs);
                if (virtMem[pid].dirty) {
                   if (ps.tryLockS(v)){
+                     ucache::assert_crash(buffer->CachedToEvicting(bs));
                      buffer->snap = bs;
-                     bs->state = ucache::BufferState::Evicting;
                      toWrite.push_back(buffer);
                   }else{
                      delete bs;
@@ -961,6 +959,7 @@ void BufferManager::evict() {
       PageState& ps = getPageState(pid);
       u64 v = ps.stateAndVersion;
       if((PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v)){
+         delete buf->snap;
          delete buf;
          return true;
       }
@@ -976,6 +975,7 @@ void BufferManager::evict() {
          toEvict.push_back(buf);
       else{
          ps.unlockS();
+         delete buf->snap;
          delete buf;
       }
    }
@@ -984,15 +984,19 @@ void BufferManager::evict() {
    addressesToInvlpg.reserve(toEvict.size());
    // 4. remove from page table
    for(ucache::Buffer* buf: toEvict){
-      buf->updateSnapshot(buf->snap);
       u64 frame = buf->EvictingToUncached(buf->snap);
-      if(frame == 0){
-         ucache::crash_osv();
+      buf->updateSnapshot(buf->snap);
+      if(frame==0){
+         PID pid = toPID(buf->baseVirt);
+         getPageState(pid).unlockS();
+         delete buf->snap;
+         delete buf;
+      }else{
+         addressesToInvlpg.push_back(buf->baseVirt);
+         ucache::frames_free_phys_addr(frame, pageSize);
       }
-      addressesToInvlpg.push_back(buf->baseVirt);
-      ucache::frames_free_phys_addr(frame, pageSize);
    }
-   if(toEvict.size() < 0)
+   if(addressesToInvlpg.size() < mmu::invlpg_max_pages)
       mmu::invlpg_tlb_all(&addressesToInvlpg);
    else
       mmu::flush_tlb_all();
