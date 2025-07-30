@@ -14,6 +14,8 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 * THREADS: number of threads; default=1
 * DATASIZE: number of warehouses for TPC-C, number of tuples for random read benchmark; default=10
 
+For mmap-based: PHYSGB, EXMAP, BATCH are useless
+
 ## Example Command Lines
 
 * TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./vmcache`
